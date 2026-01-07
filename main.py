@@ -11,6 +11,9 @@ import subprocess
 import numpy as np
 from collections import defaultdict
 from ultralytics import YOLO
+import easyocr
+import msvcrt
+import sys
 
 # --- 1. ROBUST AUDIO WORKER WITH PREEMPTION ---
 class TTSWorker(threading.Thread):
@@ -115,10 +118,44 @@ class SmartVisionApp:
         self.crowd_threshold = 3  # Number of people to consider a crowd
         self.crowd_mode_timer = 0  # Hysteresis timer for crowd mode (frames)
 
+        # Mode Management
+        self.mode = 'detection'  # 'detection', 'search', or 'ocr'
+        
+        # Search Mode
+        self.search_targets = ['person', 'cell phone', 'bottle', 'chair']
+        self.current_search_index = 0
+        self.search_cooldown = 2.0  # Faster cooldown for search mode
+        self.last_search_announcement = 0
+        
+        # OCR Mode
+        print("Initializing OCR reader...")
+        self.ocr_reader = easyocr.Reader(['en'])  # Initialize once
+        print("OCR reader ready.")
+
         # Visual setup
         self.cap.set(3, 640)  # Width
         self.cap.set(4, 480)  # Height
+        
+        # Check if OpenCV GUI is available
+        self.gui_available = self._check_gui_support()
+        
         print("System Ready. Press 'q' to exit.")
+        print("Controls: 's' = Search Mode, 'r' = OCR Mode, 'q' = Quit")
+        if not self.gui_available:
+            print("Warning: OpenCV GUI not available. Running in headless mode.")
+            print("Keyboard input will work via console.")
+    
+    def _check_gui_support(self):
+        """Check if OpenCV GUI functions are available."""
+        try:
+            # Try to create a test window
+            test_img = np.zeros((100, 100, 3), dtype=np.uint8)
+            cv2.imshow("_test_", test_img)
+            cv2.waitKey(1)
+            cv2.destroyAllWindows()
+            return True
+        except:
+            return False
 
     def calculate_brightness(self, frame):
         """
@@ -148,6 +185,25 @@ class SmartVisionApp:
             return "at 1 o'clock"
         else: 
             return "at 2 o'clock"
+    
+    def get_position_lrc(self, center_x, frame_width):
+        """
+        Get Left/Right/Center position for Search Mode.
+        
+        Args:
+            center_x: X coordinate of object center
+            frame_width: Width of the frame
+            
+        Returns:
+            str: 'Left', 'Right', or 'Center'
+        """
+        third = frame_width / 3
+        if center_x < third:
+            return "Left"
+        elif center_x < 2 * third:
+            return "Center"
+        else:
+            return "Right"
 
     def estimate_distance(self, box_height, frame_height):
         """Estimates distance based on how tall the object is in the frame"""
@@ -162,6 +218,7 @@ class SmartVisionApp:
         """
         Process frame with all advanced features:
         - Low light detection
+        - Mode-specific processing (detection/search/ocr)
         - Crowd grouping
         - Persistence tracking
         - Priority-based preemption
@@ -181,7 +238,102 @@ class SmartVisionApp:
             # Don't process detections in low light
             cv2.putText(frame, f"Low Light: {brightness:.1f}", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(frame, f"Mode: {self.mode.upper()}", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             return frame
+        
+        # Display current mode
+        cv2.putText(frame, f"Mode: {self.mode.upper()}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        # --- SEARCH MODE PROCESSING ---
+        if self.mode == 'search':
+            return self.process_search_mode(frame, current_time)
+        
+        # --- OCR MODE PROCESSING (handled in run loop, not here) ---
+        if self.mode == 'ocr':
+            cv2.putText(frame, "OCR Mode - Press 'r' to read text", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            return frame
+        
+        # --- DEFAULT DETECTION MODE ---
+        return self.process_detection_mode(frame, current_time)
+    
+    def process_search_mode(self, frame, current_time):
+        """Process frame in Search Mode - look for specific target only."""
+        frame_h, frame_w = frame.shape[:2]
+        target = self.search_targets[self.current_search_index]
+        
+        # Display search target
+        cv2.putText(frame, f"Searching: {target}", (10, 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
+        # Run detection
+        results = self.model(frame, verbose=False, stream=True)
+        
+        target_detections = []
+        
+        for r in results:
+            for box in r.boxes:
+                conf = float(box.conf[0])
+                if conf < self.conf_threshold:
+                    continue
+                
+                cls_id = int(box.cls[0])
+                label = self.model.names[cls_id]
+                
+                # Only process the target object
+                if label != target:
+                    continue
+                
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                center_x = (x1 + x2) / 2
+                
+                # Get Left/Right/Center position
+                position = self.get_position_lrc(center_x, frame_w)
+                
+                target_detections.append({
+                    'label': label,
+                    'conf': conf,
+                    'position': position,
+                    'box': (x1, y1, x2, y2),
+                    'center_x': center_x
+                })
+        
+        # Process search results
+        if target_detections:
+            # Use the detection with highest confidence
+            best_detection = max(target_detections, key=lambda x: x['conf'])
+            position = best_detection['position']
+            
+            # Check cooldown
+            if current_time - self.last_search_announcement > self.search_cooldown:
+                if position == "Center":
+                    text = f"Found {target} Center"
+                elif position == "Left":
+                    text = "Turn Left"
+                else:  # Right
+                    text = "Turn Right"
+                
+                print(f"Search Mode: {text}")
+                self.tts.speak(text, preempt=True)
+                self.last_search_announcement = current_time
+            
+            # Draw detection
+            x1, y1, x2, y2 = best_detection['box']
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            cv2.putText(frame, f"{target} {position}", (x1, y1-10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        else:
+            # No target found - draw indicator
+            cv2.putText(frame, f"No {target} detected", (10, 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        return frame
+    
+    def process_detection_mode(self, frame, current_time):
+        """Process frame in default Detection Mode - all existing logic."""
+        frame_h, frame_w = frame.shape[:2]
         
         # --- OBJECT DETECTION ---
         results = self.model(frame, verbose=False, stream=True)
@@ -294,10 +446,77 @@ class SmartVisionApp:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
         # Display brightness
+        brightness = self.calculate_brightness(frame)
         cv2.putText(frame, f"Brightness: {brightness:.1f}", (10, frame_h - 10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         return frame
+    
+    def process_ocr(self, frame):
+        """
+        Process OCR on current frame with ROI cropping and preprocessing.
+        Optimized for reading newspaper text without DroidCam overlay.
+        
+        Args:
+            frame: Current video frame
+            
+        Returns:
+            str: Detected text or None
+        """
+        try:
+            # --- STEP 1: ROI CROP (Center 60% - remove 20% from each side) ---
+            frame_h, frame_w = frame.shape[:2]
+            
+            # Calculate crop boundaries (center 60%)
+            top_margin = int(frame_h * 0.2)      # Remove top 20%
+            bottom_margin = int(frame_h * 0.8)   # Keep until 80% (bottom 20% removed)
+            left_margin = int(frame_w * 0.2)     # Remove left 20%
+            right_margin = int(frame_w * 0.8)    # Keep until 80% (right 20% removed)
+            
+            # Crop to center region
+            roi = frame[top_margin:bottom_margin, left_margin:right_margin]
+            
+            # --- STEP 2: IMAGE PREPROCESSING ---
+            # Convert to grayscale
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            
+            # Apply Binary Threshold using Otsu's method
+            # This makes text black and background white, improving OCR accuracy
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # --- STEP 3: RUN OCR ON PROCESSED IMAGE ---
+            results = self.ocr_reader.readtext(binary)
+            
+            if not results:
+                return None
+            
+            # --- STEP 4: GARBAGE FILTER ---
+            filtered_texts = []
+            for result in results:
+                text = result[1].strip()
+                
+                # Filter out lines containing "DroidCam" (case-insensitive)
+                if 'droidcam' in text.lower():
+                    continue
+                
+                # Filter out single-character results (noise)
+                if len(text) <= 1:
+                    continue
+                
+                filtered_texts.append(text)
+            
+            if not filtered_texts:
+                return None
+            
+            # Join filtered results into a single string
+            combined_text = " ".join(filtered_texts)
+            return combined_text
+            
+        except Exception as e:
+            print(f"OCR Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def announce(self, obj, preempt=False):
         """
@@ -328,6 +547,41 @@ class SmartVisionApp:
         self.tts.speak(text, preempt=preempt)
         self.last_spoken_time[label] = current_time
 
+    def _get_keyboard_input(self):
+        """
+        Get keyboard input - works with or without OpenCV GUI.
+        Returns character code or -1 if no key pressed.
+        """
+        if self.gui_available:
+            try:
+                return cv2.waitKey(1) & 0xFF
+            except:
+                # Fallback if waitKey fails
+                self.gui_available = False
+                return -1
+        else:
+            # Use msvcrt for Windows console input (non-blocking)
+            if msvcrt.kbhit():
+                key = msvcrt.getch()
+                return ord(key) if isinstance(key, bytes) else ord(key)
+            return -1
+    
+    def _display_frame(self, frame, window_name="Smart Vision"):
+        """Display frame if GUI is available."""
+        if self.gui_available:
+            try:
+                cv2.imshow(window_name, frame)
+            except:
+                self.gui_available = False
+    
+    def _cleanup_windows(self):
+        """Clean up OpenCV windows if GUI is available."""
+        if self.gui_available:
+            try:
+                cv2.destroyAllWindows()
+            except:
+                pass
+    
     def run(self):
         frame_count = 0
         try:
@@ -336,21 +590,53 @@ class SmartVisionApp:
                 if not ret: 
                     break
                 
+                # Handle keyboard input
+                key = self._get_keyboard_input()
+                
+                if key == ord('q') or key == ord('Q'):
+                    break
+                elif key == ord('s') or key == ord('S'):
+                    # Toggle Search Mode - cycle through targets
+                    if self.mode == 'search':
+                        self.current_search_index = (self.current_search_index + 1) % len(self.search_targets)
+                    else:
+                        self.mode = 'search'
+                        self.current_search_index = 0
+                    
+                    target = self.search_targets[self.current_search_index]
+                    announcement = f"Search Mode: Looking for {target}"
+                    print(announcement)
+                    self.tts.speak(announcement, preempt=True)
+                elif key == ord('r') or key == ord('R'):
+                    # Trigger OCR Mode
+                    if self.mode != 'ocr':
+                        self.mode = 'ocr'
+                        print("OCR Mode activated")
+                        self.tts.speak("Reading text", preempt=True)
+                        
+                        # Process OCR on current frame
+                        text = self.process_ocr(frame)
+                        if text:
+                            print(f"OCR Result: {text}")
+                            self.tts.speak(text, preempt=False)
+                        else:
+                            print("No text found")
+                            self.tts.speak("No text found", preempt=False)
+                        
+                        # Return to detection mode after OCR
+                        self.mode = 'detection'
+                
                 # Performance Optimization: Process every Nth frame
                 frame_count += 1
                 if frame_count % self.frame_skip == 0:
                     frame = self.process_frame(frame)
-                    cv2.imshow("Smart Vision", frame)
+                    self._display_frame(frame)
                 else:
                     # Just show the video without processing to keep FPS high
-                    cv2.imshow("Smart Vision", frame)
-                
-                # IMPORTANT: WaitKey is needed for the window to refresh
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+                    self._display_frame(frame)
         finally:
             self.cap.release()
-            cv2.destroyAllWindows()
+            self._cleanup_windows()
 
 if __name__ == "__main__":
     # DroidCam URL - Using IP from your DroidCam app
