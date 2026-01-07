@@ -122,8 +122,8 @@ class SmartVisionApp:
         self.mode = 'detection'  # 'detection', 'search', or 'ocr'
         
         # Search Mode
-        self.search_targets = ['person', 'cell phone', 'bottle', 'chair']
-        self.current_search_index = 0
+        self.search_targets = ['person', 'cell phone', 'bottle', 'chair', 'cup']
+        self.target_index = 0  # Initialize target index
         self.search_cooldown = 2.0  # Faster cooldown for search mode
         self.last_search_announcement = 0
         
@@ -140,7 +140,7 @@ class SmartVisionApp:
         self.gui_available = self._check_gui_support()
         
         print("System Ready. Press 'q' to exit.")
-        print("Controls: 's' = Search Mode, 'r' = OCR Mode, 'q' = Quit")
+        print("Controls: 's' = Toggle Search Mode, 'n' = Next Target (in Search Mode), 'r' = OCR Mode, 'q' = Quit")
         if not self.gui_available:
             print("Warning: OpenCV GUI not available. Running in headless mode.")
             print("Keyboard input will work via console.")
@@ -262,7 +262,7 @@ class SmartVisionApp:
     def process_search_mode(self, frame, current_time):
         """Process frame in Search Mode - look for specific target only."""
         frame_h, frame_w = frame.shape[:2]
-        target = self.search_targets[self.current_search_index]
+        target = self.search_targets[self.target_index]
         
         # Display search target
         cv2.putText(frame, f"Searching: {target}", (10, 60),
@@ -596,17 +596,30 @@ class SmartVisionApp:
                 if key == ord('q') or key == ord('Q'):
                     break
                 elif key == ord('s') or key == ord('S'):
-                    # Toggle Search Mode - cycle through targets
-                    if self.mode == 'search':
-                        self.current_search_index = (self.current_search_index + 1) % len(self.search_targets)
-                    else:
+                    # Master toggle for Search Mode
+                    if self.mode == 'detection':
+                        # Switch to search mode
                         self.mode = 'search'
-                        self.current_search_index = 0
-                    
-                    target = self.search_targets[self.current_search_index]
-                    announcement = f"Search Mode: Looking for {target}"
-                    print(announcement)
-                    self.tts.speak(announcement, preempt=True)
+                        target = self.search_targets[self.target_index]
+                        announcement = f"Search Mode Active. Looking for {target}"
+                        print(announcement)
+                        self.tts.speak(announcement, preempt=True)
+                    elif self.mode == 'search':
+                        # Switch back to detection mode
+                        self.mode = 'detection'
+                        announcement = "Back to Normal Mode"
+                        print(announcement)
+                        self.tts.speak(announcement, preempt=True)
+                elif key == ord('n') or key == ord('N'):
+                    # Next target - only works in search mode
+                    if self.mode == 'search':
+                        # Cycle to next target
+                        self.target_index = (self.target_index + 1) % len(self.search_targets)
+                        target = self.search_targets[self.target_index]
+                        announcement = f"Looking for {target}"
+                        print(announcement)
+                        self.tts.speak(announcement, preempt=True)
+                    # Do nothing if not in search mode
                 elif key == ord('r') or key == ord('R'):
                     # Trigger OCR Mode
                     if self.mode != 'ocr':
@@ -640,10 +653,14 @@ class SmartVisionApp:
 
 if __name__ == "__main__":
     # DroidCam URL - Using IP from your DroidCam app
-    # Device IPs shown: 100.123.251.230 or 10.171.3.216
-    # Using local network IP (10.171.3.216) - if this doesn't work, try the other IP
-    droidcam_url = "http://10.171.3.216:4747/video"
-    # Alternative: droidcam_url = "http://100.123.251.230:4747/video"
+    # Available IPs:
+    # - WiFi IP: 192.168.1.8
+    # - Device IPs: 100.123.251.230 or 10.171.3.216
+    # Using WiFi IP (192.168.1.8) - change to other IPs if needed
+    droidcam_url = "http://192.168.1.8:4747/video"
+    # Alternatives:
+    # droidcam_url = "http://10.171.3.216:4747/video"
+    # droidcam_url = "http://100.123.251.230:4747/video"
     
     # Choose video source:
     # - Use 0 for local webcam
